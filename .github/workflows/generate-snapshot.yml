@@ -1,0 +1,139 @@
+# .github/workflows/generate-snapshot.yml
+name: "snapshot V2 - No bloat!"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    env:
+      # You can put OpenRCT2 or OpenTTD here
+      REPOS: |
+        https://github.com/phaserjs/template-react
+      
+      # STRICT ALLOW-LIST: Only read the contents of these specific pure-code file types.
+      ALLOWED_EXTS: .cpp,.hpp,.c,.h,.cc,.cxx
+      
+      # AGGRESSIVE SKIP: Ignore all documentation, testing, languages, and sprite/asset folders
+      SKIP_DIRS: .git,node_modules,.github,.vscode,build,dist,out,bin,obj,testdata,tests,test,sprites,data,resources,assets,lang,translations,docs,cmake,doxygen
+      
+      # REDUCED CAP: 40,000 chars is roughly 10,000 lines. This prevents giant hardcoded C++ arrays from being read.
+      MAX_CHARS_PER_FILE: "40000"
+
+    steps:
+      - name: Check out this repo (host repo)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install git
+        run: git --version
+
+      - name: Clone targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p clones
+          printf "%s\n" "$REPOS" | awk 'NF' | sort -u > repo_list.txt
+          while read -r url; do
+            name="$(basename "$url")"
+            echo "::group::Cloning $url"
+            git clone --depth 1 "$url" "clones/$name" || echo "WARN: clone failed for $url"
+            echo "::endgroup::"
+          done < repo_list.txt
+
+      - name: Generate snapshot (Pure Code & Skeleton)
+        id: gen
+        shell: python
+        run: |
+          import os, sys, subprocess, shlex, pathlib
+
+          WORK = os.environ.get("GITHUB_WORKSPACE", ".")
+          ROOT = pathlib.Path(WORK) / "clones"
+          SKIP_DIRS = set(os.environ.get("SKIP_DIRS","").split(","))
+          MAX_CHARS = int(os.environ.get("MAX_CHARS_PER_FILE","40000"))
+          ALLOWED_EXTS = set(e.strip().lower() for e in os.environ.get("ALLOWED_EXTS","").split(","))
+          
+          out_path = pathlib.Path("repo_snapshot.md")
+
+          def should_skip_dir(dirname:str)->bool:
+            return dirname.lower() in SKIP_DIRS
+
+          def is_allowed_code(relpath:str)->bool:
+            ext = pathlib.Path(relpath).suffix.lower()
+            return ext in ALLOWED_EXTS
+
+          def repo_head_sha(repo_dir: pathlib.Path) -> str:
+            try:
+              return subprocess.check_output(["git","-C",str(repo_dir),"rev-parse","HEAD"], text=True).strip()
+            except Exception:
+              return "unknown"
+
+          lines =[]
+          lines.append(f"# Consolidated Repository Snapshot (Pure Code Edition)\n\n")
+          
+          for repo_dir in sorted(ROOT.iterdir()):
+            if not repo_dir.is_dir():
+              continue
+            sha = repo_head_sha(repo_dir)
+            try:
+              remote = subprocess.check_output(["git","-C",str(repo_dir),"remote","get-url","origin"], text=True).strip()
+            except Exception:
+              remote = f"(unknown remote for {repo_dir.name})"
+            gh_url = remote.replace(".git","")
+            lines.append(f"## {repo_dir.name} @ {sha}\nSource: {gh_url}\n\n")
+
+            for root, dirs, files in os.walk(repo_dir):
+              # prune skip directories aggressively
+              dirs[:] =[d for d in dirs if not should_skip_dir(d)]
+              files.sort()
+              
+              for fn in files:
+                fp = pathlib.Path(root) / fn
+                rel = fp.relative_to(repo_dir).as_posix()
+                
+                # If it's not a code file, just list its existence so the AI knows it's there (The Skeleton)
+                if not is_allowed_code(rel):
+                  lines.append(f"📁 `{rel}` *(Content skipped - Non-code file)*\n")
+                  continue
+                  
+                # If it IS a code file, print its path and code
+                blob_url = f"{gh_url}/blob/main/{rel}"
+                lines.append(f"\n### {rel}\n{blob_url}\n")
+                try:
+                  with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(MAX_CHARS + 1)
+                    truncated = len(content) > MAX_CHARS
+                    content = content[:MAX_CHARS]
+                  
+                  ext = pathlib.Path(fn).suffix.lstrip(".") or "cpp"
+                  lines.append(f"```{ext}\n{content}\n```")
+                  
+                  if truncated:
+                    lines.append("\n> ⚠️ *[File truncated: Exceeded char limit. Likely a massive data array.]*\n")
+                  lines.append("\n---\n")
+                except Exception as e:
+                  lines.append(f"```\nError reading file: {e}\n```\n---\n")
+
+          with open(out_path, "w", encoding="utf-8") as w:
+            w.write("".join(lines))
+          print(f"::notice::Wrote {out_path} ({os.path.getsize(out_path)} bytes)")
+
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-snapshot
+          path: repo_snapshot.md
+          if-no-files-found: error
+          retention-days: 7
